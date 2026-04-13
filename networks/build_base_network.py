@@ -143,3 +143,11 @@ def build_base_network_and_data(cfg):
         print(f"18-node raw demand max: {np.max(raw_total_demand):.3f} kW")
 
     return net, coords, bus_map, node_data
+
+def load_simbench_network(simbench_code: str):
+    """
+    加载原始的 SimBench 网络。
+    """
+    if sb is None:
+        raise ImportError("simbench library is not installed or import failed.")
+    return sb.get_simbench_net(simbench_code)

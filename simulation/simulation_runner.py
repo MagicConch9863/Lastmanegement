@@ -8,116 +8,12 @@ import numpy as np
 import pandas as pd
 
 from configs.stackelberg_config import StackelbergConfig
-from models.prosumer_model import solve_all_prosumers
-from models.powerflow_interface import run_time_series_powerflow, compute_network_penalty
+from models.leader_problem import (
+    evaluate_given_price,
+    initialize_leader_price,
+    solve_leader_problem,
+)
 from networks.plot_network_layout import plot_network_layout
-
-
-def initialize_leader_price(cfg: StackelbergConfig, real_price_signal) -> np.ndarray:
-    price = np.asarray(real_price_signal, dtype=float).copy()
-    return np.clip(price, cfg.price_min_eur_per_kwh, cfg.price_max_eur_per_kwh)
-
-
-def compute_leader_objective(
-    leader_price,
-    pf_results,
-    network_penalty,
-    cfg: StackelbergConfig,
-) -> Dict[str, float]:
-    leader_price = np.asarray(leader_price, dtype=float)
-    pcc_import_kw = np.asarray(pf_results["grid_import_from_ext_grid_kw"], dtype=float)
-
-    wholesale_cost = float(np.sum(leader_price * pcc_import_kw * cfg.time_step_hours))
-    smooth_penalty = float(
-        cfg.price_smoothing_weight * np.sum(np.diff(leader_price, prepend=leader_price[0]) ** 2)
-    )
-
-    total_objective = (
-        cfg.weight_wholesale_cost * wholesale_cost
-        + network_penalty["total_network_penalty"]
-        + smooth_penalty
-    )
-
-    return {
-        "wholesale_cost": wholesale_cost,
-        "smooth_penalty": smooth_penalty,
-        "leader_objective": total_objective,
-    }
-
-
-def update_leader_price(
-    leader_price,
-    real_price_signal,
-    pf_results,
-    cfg: StackelbergConfig,
-) -> np.ndarray:
-    leader_price = np.asarray(leader_price, dtype=float)
-    real_price_signal = np.asarray(real_price_signal, dtype=float)
-    pcc_import_kw = np.asarray(pf_results["grid_import_from_ext_grid_kw"], dtype=float)
-
-    lref = cfg.target_import_kw
-    if lref is None:
-        raise ValueError("cfg.target_import_kw must be set before updating leader price.")
-
-    deviation = (pcc_import_kw - lref) / max(lref, 1.0)
-
-    candidate = leader_price + cfg.leader_step_size * deviation
-    candidate = (1.0 - cfg.price_damping) * candidate + cfg.price_damping * real_price_signal
-
-    if cfg.price_smoothing_weight > 0.0 and len(candidate) > 2:
-        smoothed = candidate.copy()
-        smoothed[1:-1] = 0.25 * candidate[:-2] + 0.50 * candidate[1:-1] + 0.25 * candidate[2:]
-        candidate = smoothed
-
-    return np.clip(candidate, cfg.price_min_eur_per_kwh, cfg.price_max_eur_per_kwh)
-
-
-def summarize_follower_results(follower_results) -> Dict[str, np.ndarray]:
-    sample_bus = next(iter(follower_results.keys()))
-    horizon = len(follower_results[sample_bus].p_grid_kw)
-
-    total_grid_kw = np.zeros(horizon, dtype=float)
-    total_bat_kw = np.zeros(horizon, dtype=float)
-
-    for result in follower_results.values():
-        total_grid_kw += np.asarray(result.p_grid_kw, dtype=float)
-        total_bat_kw += np.asarray(result.p_bat_kw, dtype=float)
-
-    return {
-        "aggregate_grid_kw": total_grid_kw,
-        "aggregate_battery_kw": total_bat_kw,
-    }
-
-
-def evaluate_given_price(net, node_data, price_signal, cfg):
-    follower_results = solve_all_prosumers(
-        node_data=node_data,
-        leader_price=price_signal,
-        cfg=cfg,
-    )
-
-    pf_results = run_time_series_powerflow(
-        net_base=net,
-        selected_bus_ids=node_data["bus_ids"],
-        follower_results=follower_results,
-        horizon=cfg.horizon,
-        cfg=cfg,
-    )
-
-    network_penalty = compute_network_penalty(
-        pf_results=pf_results,
-        cfg=cfg,
-    )
-
-    aggregate = summarize_follower_results(follower_results)
-
-    return {
-        "price_signal": np.asarray(price_signal, dtype=float),
-        "follower_results": follower_results,
-        "pf_results": pf_results,
-        "network_penalty": network_penalty,
-        "aggregate": aggregate,
-    }
 
 
 def build_iteration_dataframe(history) -> pd.DataFrame:
@@ -127,13 +23,15 @@ def build_iteration_dataframe(history) -> pd.DataFrame:
             {
                 "iteration": item["iteration"],
                 "leader_objective": item["leader_metrics"]["leader_objective"],
-                "wholesale_cost": item["leader_metrics"]["wholesale_cost"],
-                "smooth_penalty": item["leader_metrics"]["smooth_penalty"],
-                "network_penalty": item["network_penalty"]["total_network_penalty"],
-                "peak_penalty": item["network_penalty"]["peak_penalty"],
-                "voltage_penalty": item["network_penalty"]["voltage_penalty"],
-                "line_penalty": item["network_penalty"]["line_penalty"],
-                "trafo_penalty": item["network_penalty"]["trafo_penalty"],
+                "peak_penalty": item["leader_metrics"]["peak_penalty"],
+                "track_penalty": item["leader_metrics"]["track_penalty"],
+                "price_magnitude_penalty": item["leader_metrics"]["price_magnitude_penalty"],
+                "price_dynamic_penalty": item["leader_metrics"]["price_dynamic_penalty"],
+                "security_penalty": item["leader_metrics"]["security_penalty"],
+                "grid_capacity_penalty_raw": item["network_penalty"]["grid_capacity_penalty"],
+                "voltage_penalty_raw": item["network_penalty"]["voltage_penalty"],
+                "line_penalty_raw": item["network_penalty"]["line_penalty"],
+                "trafo_penalty_raw": item["network_penalty"]["trafo_penalty"],
                 "max_price_change": item["max_price_change"],
             }
         )
@@ -232,13 +130,19 @@ def save_outputs(
     hourly_df = pd.DataFrame(
         {
             "hour": np.arange(cfg.horizon),
-            "real_price_eur_per_kwh": np.asarray(best_result["real_price_signal"], dtype=float),
+            "real_price_eur_per_kwh": np.asarray(baseline_result["price_signal"], dtype=float),
             "leader_price_eur_per_kwh": np.asarray(best_result["leader_price"], dtype=float),
             "baseline_pcc_import_kw": np.asarray(
                 baseline_result["pf_results"]["grid_import_from_ext_grid_kw"], dtype=float
             ),
             "optimized_pcc_import_kw": np.asarray(
                 best_result["pf_results"]["grid_import_from_ext_grid_kw"], dtype=float
+            ),
+            "baseline_aggregate_grid_kw": np.asarray(
+                baseline_result["aggregate"]["aggregate_grid_kw"], dtype=float
+            ),
+            "optimized_aggregate_grid_kw": np.asarray(
+                best_result["aggregate"]["aggregate_grid_kw"], dtype=float
             ),
             "baseline_aggregate_battery_kw": np.asarray(
                 baseline_result["aggregate"]["aggregate_battery_kw"], dtype=float
@@ -276,7 +180,7 @@ def plot_main_result_figure(
         dtype=float,
     )
 
-    real_price = np.asarray(best_result["real_price_signal"], dtype=float)
+    real_price = np.asarray(baseline_result["price_signal"], dtype=float)
     leader_price = np.asarray(best_result["leader_price"], dtype=float)
 
     lref = metrics["lref_kw"]
@@ -294,7 +198,7 @@ def plot_main_result_figure(
     ax1.plot(t, after, linewidth=2.8, label="Optimized total import")
     ax1.axhline(lref, linestyle=":", linewidth=2.0, label="Lref")
     ax1.set_ylabel("PCC Import (kW)")
-    ax1.set_title("Price–Network Stability Result")
+    ax1.set_title("Stackelberg Result")
     ax1.grid(True, alpha=0.3)
     ax1.legend(loc="best")
 
@@ -318,7 +222,7 @@ def plot_main_result_figure(
     ax2 = axes[1]
     ax2.plot(t, real_price, linewidth=2.0, label="Real market price")
     ax2.plot(t, leader_price, linewidth=2.0, label="Leader price")
-    ax2.set_xlabel("Hour")
+    ax2.set_xlabel("Time step")
     ax2.set_ylabel("Price (EUR/kWh)")
     ax2.grid(True, alpha=0.3)
     ax2.legend(loc="best")
@@ -342,14 +246,21 @@ def print_run_summary(
     metrics,
     cfg: StackelbergConfig,
 ) -> None:
+    lm = best_result["leader_metrics"]
+    npen = best_result["network_penalty"]
+
     print("\n" + "=" * 70)
     print("Stackelberg simulation summary")
     print("=" * 70)
     print(f"Iterations used                 : {len(history)}")
-    print(f"Best leader objective           : {best_result['leader_metrics']['leader_objective']:.6f}")
-    print(f"Wholesale-like cost             : {best_result['leader_metrics']['wholesale_cost']:.6f}")
-    print(f"Total network penalty           : {best_result['network_penalty']['total_network_penalty']:.6f}")
-    print(f"Lref (daily average)            : {metrics['lref_kw']:.3f} kW")
+    print(f"Best leader objective           : {lm['leader_objective']:.6f}")
+    print(f"Peak penalty                    : {lm['peak_penalty']:.6f}")
+    print(f"Track penalty                   : {lm['track_penalty']:.6f}")
+    print(f"Price magnitude penalty         : {lm['price_magnitude_penalty']:.6f}")
+    print(f"Price dynamic penalty           : {lm['price_dynamic_penalty']:.6f}")
+    print(f"Security penalty                : {lm['security_penalty']:.6f}")
+    print(f"Raw grid-capacity penalty       : {npen['grid_capacity_penalty']:.6f}")
+    print(f"Lref (daily average baseline)   : {metrics['lref_kw']:.3f} kW")
     print(f"Peak shaving                    : {metrics['peak_shaving_pct']:.2f}%")
     print(f"Valley filling                  : {metrics['valley_filling_pct']:.2f}%")
     print(f"Fluctuation reduction           : {metrics['fluctuation_reduction_pct']:.2f}%")
@@ -358,16 +269,10 @@ def print_run_summary(
     print(f"MSE to Lref after               : {metrics['mse_after_to_lref']:.3f}")
     print("=" * 70)
 
-    if abs(metrics["energy_diff_pct"]) <= 2.0:
-        print("Daily total energy is basically preserved.")
-    else:
-        print("Daily total energy differs noticeably; check battery constraints or export behavior.")
-
 
 def run_stackelberg_simulation(cfg: StackelbergConfig) -> Dict[str, Any]:
     cfg.validate()
 
-    # 只保存网络图，不显示
     net, coords, groups, node_data, device_df, bus_map = plot_network_layout(
         cfg=cfg,
         save_path=os.path.join(cfg.output_dir, "network_layout.png"),
@@ -376,102 +281,45 @@ def run_stackelberg_simulation(cfg: StackelbergConfig) -> Dict[str, Any]:
 
     real_price_signal = np.asarray(node_data["leader_price_init"], dtype=float)
 
+    # baseline阶段：只算 follower + powerflow + penalty + aggregate
+    # 不算 leader objective，因为这时 Lref 还没定义
     baseline_result = evaluate_given_price(
         net=net,
         node_data=node_data,
         price_signal=real_price_signal,
         cfg=cfg,
+        compute_leader_metrics=False,
     )
 
     baseline_import = np.asarray(
         baseline_result["pf_results"]["grid_import_from_ext_grid_kw"],
         dtype=float,
     )
-    cfg.target_import_kw = float(np.mean(baseline_import))
+
+    if cfg.lref_mode == "baseline_mean":
+        cfg.target_import_kw = float(np.mean(baseline_import))
+    elif cfg.lref_mode == "fixed":
+        if cfg.lref_fixed_kw is None:
+            raise ValueError("cfg.lref_fixed_kw must be provided when lref_mode='fixed'.")
+        cfg.target_import_kw = float(cfg.lref_fixed_kw)
+    else:
+        raise ValueError(f"Unsupported lref_mode: {cfg.lref_mode}")
 
     if cfg.debug_mode:
-        print(f"\nComputed Lref from daily average baseline PCC import: {cfg.target_import_kw:.4f} kW")
+        print(f"\nComputed Lref from baseline PCC import mean: {cfg.target_import_kw:.4f} kW")
 
-    leader_price = initialize_leader_price(cfg, real_price_signal)
+    initial_price = initialize_leader_price(cfg, real_price_signal)
 
-    history = []
-    best_result = None
-    best_objective = np.inf
+    leader_solution = solve_leader_problem(
+        net=net,
+        node_data=node_data,
+        real_price_signal=real_price_signal,
+        initial_price=initial_price,
+        cfg=cfg,
+    )
 
-    for k in range(cfg.max_stackelberg_iter):
-        follower_results = solve_all_prosumers(
-            node_data=node_data,
-            leader_price=leader_price,
-            cfg=cfg,
-        )
-
-        pf_results = run_time_series_powerflow(
-            net_base=net,
-            selected_bus_ids=node_data["bus_ids"],
-            follower_results=follower_results,
-            horizon=cfg.horizon,
-            cfg=cfg,
-        )
-
-        network_penalty = compute_network_penalty(
-            pf_results=pf_results,
-            cfg=cfg,
-        )
-
-        leader_metrics = compute_leader_objective(
-            leader_price=leader_price,
-            pf_results=pf_results,
-            network_penalty=network_penalty,
-            cfg=cfg,
-        )
-
-        aggregate = summarize_follower_results(follower_results)
-
-        new_price = update_leader_price(
-            leader_price=leader_price,
-            real_price_signal=real_price_signal,
-            pf_results=pf_results,
-            cfg=cfg,
-        )
-
-        max_price_change = float(np.max(np.abs(new_price - leader_price)))
-
-        iteration_result = {
-            "iteration": k,
-            "leader_price": leader_price.copy(),
-            "real_price_signal": real_price_signal.copy(),
-            "follower_results": follower_results,
-            "pf_results": pf_results,
-            "network_penalty": network_penalty,
-            "leader_metrics": leader_metrics,
-            "aggregate": aggregate,
-            "max_price_change": max_price_change,
-            "device_df": device_df.copy(),
-        }
-        history.append(iteration_result)
-
-        if leader_metrics["leader_objective"] < best_objective:
-            best_objective = leader_metrics["leader_objective"]
-            best_result = iteration_result
-
-        if cfg.debug_mode:
-            print(
-                f"[Stackelberg] iter={k:02d}, "
-                f"leader_objective={leader_metrics['leader_objective']:.6f}, "
-                f"wholesale_cost={leader_metrics['wholesale_cost']:.6f}, "
-                f"network_penalty={network_penalty['total_network_penalty']:.6f}, "
-                f"max_price_change={max_price_change:.6f}"
-            )
-
-        leader_price = new_price
-
-        if max_price_change < cfg.price_convergence_tol:
-            if cfg.debug_mode:
-                print(f"[Stackelberg] Converged at iteration {k}.")
-            break
-
-    if best_result is None:
-        raise RuntimeError("Stackelberg simulation did not produce any valid result.")
+    history = leader_solution["history"]
+    best_result = leader_solution["best_result"]
 
     metrics = compute_comparison_metrics(
         baseline_result=baseline_result,

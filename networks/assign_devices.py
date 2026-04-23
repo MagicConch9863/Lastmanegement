@@ -12,10 +12,14 @@ def assign_devices(cfg):
     selected_bus_ids = node_data["bus_ids"]
     selected_bus_names = node_data["bus_names"]
 
-    if len(selected_bus_names) != 18:
-        raise ValueError("The residential feeder must contain exactly 18 nodes.")
+    n_selected = len(selected_bus_names)
+    expected = cfg.n_passive_load + cfg.n_pv_only + cfg.n_pv_battery
+    if n_selected != expected:
+        raise ValueError(
+            "Selected bus count must equal "
+            "n_passive_load + n_pv_only + n_pv_battery."
+        )
 
-    # fixed group sizes
     shuffled_names = selected_bus_names.copy()
     random.shuffle(shuffled_names)
 
@@ -77,18 +81,24 @@ def assign_devices(cfg):
 
     device_df = pd.DataFrame(records)
 
+    # groups used by the layout plot
     groups = {
         "upstream": ["Bus 0", "Bus R0"],
         "passive": passive_names,
         "pv_only": pv_only_names,
         "active": active_names,
+        "inactive_residential": [
+            name for name in node_data["all_residential_bus_names"]
+            if name not in selected_bus_names
+        ],
     }
 
     if cfg.debug_mode:
         print("\nDevice assignment:")
-        print(f"Passive load nodes   : {passive_names}")
-        print(f"PV-only nodes        : {pv_only_names}")
-        print(f"PV+Battery nodes     : {active_names}")
+        print(f"Selected residential nodes : {selected_bus_names}")
+        print(f"Passive load nodes         : {passive_names}")
+        print(f"PV-only nodes              : {pv_only_names}")
+        print(f"PV+Battery nodes           : {active_names}")
         print(device_df[["bus_name", "has_pv", "has_battery", "node_type"]])
 
     return net, coords, groups, node_data, device_df, bus_map

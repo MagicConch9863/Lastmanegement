@@ -112,34 +112,48 @@ def build_base_network_and_data(cfg):
     price_signal, price_df = load_price_profile(cfg)
     load_pool, pv_pool, raw_total_demand = load_simbench_profiles_for_18_nodes(cfg)
 
-    bus_names = [f"Bus R{i}" for i in range(1, 19)]
-    bus_ids = [bus_map[name] for name in bus_names]
+    all_bus_names = [f"Bus R{i}" for i in range(1, 19)]
+    all_bus_ids = [bus_map[name] for name in all_bus_names]
+
+    # full data for all 18 buses first
+    full_load_kw = {}
+    full_pv_kw = {}
+    full_has_battery = {}
+    full_battery_capacity_kwh = {}
+    full_battery_pmax_kw = {}
+    full_energy_init_kwh = {}
+
+    for bus_id, load_profile, pv_profile in zip(all_bus_ids, load_pool, pv_pool):
+        full_load_kw[bus_id] = load_profile.tolist()
+        full_pv_kw[bus_id] = pv_profile.tolist()
+        full_has_battery[bus_id] = False
+        full_battery_capacity_kwh[bus_id] = 0.0
+        full_battery_pmax_kw[bus_id] = 0.0
+        full_energy_init_kwh[bus_id] = 0.0
+
+    selected_bus_names = cfg.get_selected_residential_bus_names()
+    selected_bus_ids = [bus_map[name] for name in selected_bus_names]
 
     node_data = {
-        "bus_ids": bus_ids,
-        "bus_names": bus_names,
-        "coords": coords,
-        "load_kw": {},
-        "pv_kw": {},
+        "bus_ids": selected_bus_ids,
+        "bus_names": selected_bus_names,
+        "coords": {name: coords[name] for name in selected_bus_names},
+        "all_residential_bus_ids": all_bus_ids,
+        "all_residential_bus_names": all_bus_names,
+        "load_kw": {bus_id: full_load_kw[bus_id] for bus_id in selected_bus_ids},
+        "pv_kw": {bus_id: full_pv_kw[bus_id] for bus_id in selected_bus_ids},
         "raw_total_load_kw": raw_total_demand.copy(),
-        "has_battery": {},
-        "battery_capacity_kwh": {},
-        "battery_pmax_kw": {},
-        "energy_init_kwh": {},
+        "has_battery": {bus_id: full_has_battery[bus_id] for bus_id in selected_bus_ids},
+        "battery_capacity_kwh": {bus_id: full_battery_capacity_kwh[bus_id] for bus_id in selected_bus_ids},
+        "battery_pmax_kw": {bus_id: full_battery_pmax_kw[bus_id] for bus_id in selected_bus_ids},
+        "energy_init_kwh": {bus_id: full_energy_init_kwh[bus_id] for bus_id in selected_bus_ids},
         "leader_price_init": price_signal.copy(),
         "raw_price_df": price_df.copy(),
     }
 
-    for bus_id, load_profile, pv_profile in zip(bus_ids, load_pool, pv_pool):
-        node_data["load_kw"][bus_id] = load_profile.tolist()
-        node_data["pv_kw"][bus_id] = pv_profile.tolist()
-        node_data["has_battery"][bus_id] = False
-        node_data["battery_capacity_kwh"][bus_id] = 0.0
-        node_data["battery_pmax_kw"][bus_id] = 0.0
-        node_data["energy_init_kwh"][bus_id] = 0.0
-
     if getattr(cfg, "debug_mode", False):
         print(f"SimBench source: {getattr(cfg, 'simbench_code', '1-LV-urban6--0-sw')}")
         print(f"18-node raw demand max: {np.max(raw_total_demand):.3f} kW")
+        print(f"Selected residential buses: {selected_bus_names}")
 
     return net, coords, bus_map, node_data

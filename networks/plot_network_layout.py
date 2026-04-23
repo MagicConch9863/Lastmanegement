@@ -22,14 +22,18 @@ def plot_network_layout(cfg, save_path=None, show_plot=False):
 
     style = {
         "upstream": {"c": "black", "m": "o", "s": 120, "lbl": "Upstream bus"},
-        "passive": {"c": "#1f77b4", "m": "s", "s": 100, "lbl": "Load only (passive)"},
-        "pv_only": {"c": "#2ca02c", "m": "^", "s": 140, "lbl": "Load + PV"},
-        "active": {"c": "#d62728", "m": "o", "s": 120, "lbl": "Load + PV + Battery (active)"},
+        "passive": {"c": "#1f77b4", "m": "s", "s": 100, "lbl": "Selected passive"},
+        "pv_only": {"c": "#2ca02c", "m": "^", "s": 140, "lbl": "Selected load + PV"},
+        "active": {"c": "#d62728", "m": "o", "s": 120, "lbl": "Selected load + PV + battery"},
+        "inactive_residential": {"c": "#BDBDBD", "m": "o", "s": 80, "lbl": "Unselected residential"},
     }
 
     for group_name, s in style.items():
-        x = [coords[n][0] for n in groups[group_name]]
-        y = [coords[n][1] for n in groups[group_name]]
+        names = groups.get(group_name, [])
+        if not names:
+            continue
+        x = [coords[n][0] for n in names]
+        y = [coords[n][1] for n in names]
         ax.scatter(
             x,
             y,
